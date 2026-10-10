@@ -1,0 +1,6 @@
+{
+  "name": "Smart Campus AI — Student Success & Campus Analytics Platform",
+  "description": "Empowering Student Success Through AI and Analytics. Comprehensive role-based platform for students, teachers, and principals to monitor academic performance, attendance, LMS, skills, placements, and campus intelligence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
