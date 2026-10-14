@@ -1,6 +1,6 @@
 import express from 'express';
 import type { Request, Response } from 'express';
-import { GoogleGenAI } from '@google/genai';
+import Groq from 'groq-sdk';
 import dotenv from 'dotenv';
 import path from 'path';
 import crypto from 'crypto';
@@ -12,17 +12,33 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
-// Initialize Gemini Client
-const ai = process.env.GEMINI_API_KEY
-  ? new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    })
-  : null;
+// Initialize Groq Client
+const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
+const groqApiKey = process.env.GROQ_API_KEY;
+const groq =
+  groqApiKey && !groqApiKey.includes('YOUR_GROQ_API_KEY') && !groqApiKey.includes('MY_')
+    ? new Groq({ apiKey: groqApiKey })
+    : null;
+
+if (!groq) {
+  console.warn('[AI] GROQ_API_KEY missing — AI endpoints will use local fallback responses.');
+} else {
+  console.log(`[AI] Groq client ready (model: ${GROQ_MODEL}).`);
+}
+
+function extractJson(text: string): any {
+  const cleaned = (text || '').trim().replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '');
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const start = cleaned.indexOf('{');
+    const end = cleaned.lastIndexOf('}');
+    if (start !== -1 && end > start) {
+      return JSON.parse(cleaned.slice(start, end + 1));
+    }
+    throw new Error('No JSON object found in model output');
+  }
+}
 
 // ==========================================
 // IN-MEMORY DATABASE & DATA MODELS
@@ -1030,8 +1046,18 @@ app.post('/api/principal/user-status', authenticateToken, (req: Request, res: Re
 });
 
 // ==========================================
-// GEMINI AI ENDPOINTS (Server-Side)
+// GROQ AI ENDPOINTS (Server-Side)
 // ==========================================
+
+// AI health check (no auth, for diagnostics)
+app.get('/api/ai/status', (_req: Request, res: Response) => {
+  res.json({
+    success: true,
+    configured: Boolean(groq),
+    model: GROQ_MODEL,
+    provider: groq ? 'Groq' : 'Local Fallback',
+  });
+});
 
 // 1. AI Study Planner Generator
 app.post('/api/ai/study-planner', authenticateToken, async (req: Request, res: Response) => {
@@ -1054,7 +1080,7 @@ app.post('/api/ai/study-planner', authenticateToken, async (req: Request, res: R
     ],
   };
 
-  if (!ai) {
+  if (!groq) {
     return res.json({ success: true, plan: defaultPlan, provider: 'Local Rule Engine' });
   }
 
@@ -1065,23 +1091,24 @@ Upcoming exam date: ${examDate || 'in 2 weeks'}.
 Target CGPA: ${targetCGPA || '9.0'}.
 Subjects: ${JSON.stringify(subjects || ['Data Structures', 'DBMS', 'Computer Networks'])}.
 
-Format the response as a JSON object with:
-"summary": string,
-"schedule": array of { "day": string, "focus": string, "duration": string, "tasks": string[] },
-"revisionPoints": string[] (3-4 crisp high-yield revision facts).`;
+Respond with ONLY a valid JSON object (no markdown, no code fences) shaped as:
+{"summary": string, "schedule": [{"day": string, "focus": string, "duration": string, "tasks": string[]}], "revisionPoints": string[] (3-4 crisp high-yield revision facts)}.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-      },
+    const completion = await groq.chat.completions.create({
+      model: GROQ_MODEL,
+      messages: [
+        { role: 'system', content: 'You are a study-planning assistant. You always reply with strict JSON only.' },
+        { role: 'user', content: prompt },
+      ],
+      temperature: 0.6,
+      max_tokens: 1500,
+      response_format: { type: 'json_object' },
     });
 
-    const parsed = JSON.parse(response.text || '{}');
-    return res.json({ success: true, plan: parsed, provider: 'Gemini 3.8 Flash' });
+    const parsed = extractJson(completion.choices[0]?.message?.content || '{}');
+    return res.json({ success: true, plan: { ...defaultPlan, ...parsed }, provider: `Groq (${GROQ_MODEL})` });
   } catch (error) {
-    console.error('Gemini Study Planner error:', error);
+    console.error('Groq Study Planner error:', error);
     return res.json({ success: true, plan: defaultPlan, provider: 'Local Fallback' });
   }
 });
@@ -1110,7 +1137,7 @@ app.post('/api/ai/chat', authenticateToken, async (req: Request, res: Response) 
     fallbackReply = `An AVL tree is a self-balancing Binary Search Tree where the difference between heights of left and right subtrees (the balance factor) cannot exceed 1 for any node. If insertion causes an imbalance, rotations (LL, RR, LR, RL) are executed in O(log n) time.`;
   }
 
-  if (!ai) {
+  if (!groq) {
     return res.json({ success: true, reply: fallbackReply, provider: 'Campus Knowledge Engine' });
   }
 
@@ -1120,21 +1147,29 @@ User details: Name: ${user.name}, Role: ${user.role}, Department: ${user.departm
 Help the user with academic guidance, formula explanations, study techniques, college regulations, and career mentorship.
 Be encouraging, precise, and professional. Distinguish verified institutional policies from academic study suggestions.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: message,
-      config: {
-        systemInstruction: systemPrompt,
-      },
+    const completion = await groq.chat.completions.create({
+      model: GROQ_MODEL,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...(Array.isArray(history)
+          ? history.slice(-10).map((m: any) => ({
+              role: m.sender === 'ai' ? ('assistant' as const) : ('user' as const),
+              content: String(m.text || '').slice(0, 2000),
+            }))
+          : []),
+        { role: 'user', content: message },
+      ],
+      temperature: 0.7,
+      max_tokens: 800,
     });
 
     return res.json({
       success: true,
-      reply: response.text || fallbackReply,
-      provider: 'Gemini 3.8 Flash',
+      reply: completion.choices[0]?.message?.content?.trim() || fallbackReply,
+      provider: `Groq (${GROQ_MODEL})`,
     });
   } catch (error) {
-    console.error('Gemini chat error:', error);
+    console.error('Groq chat error:', error);
     return res.json({ success: true, reply: fallbackReply, provider: 'Campus Knowledge Engine' });
   }
 });
@@ -1156,7 +1191,7 @@ app.post('/api/ai/risk-analysis', authenticateToken, async (req: Request, res: R
     ],
   };
 
-  if (!ai) {
+  if (!groq) {
     return res.json({ success: true, analysis: defaultExplanation });
   }
 
@@ -1167,22 +1202,24 @@ Attendance: ${attendance}%
 Average Marks: ${avgMarks}%
 Observed Note: ${reason}
 
-Provide a structured JSON output with:
-"riskAssessment": string,
-"rootCauseAnalysis": string[],
-"recommendedInterventions": string[] (3 actionable teacher/mentor interventions).`;
+Respond with ONLY a valid JSON object (no markdown, no code fences) shaped as:
+{"riskAssessment": string, "rootCauseAnalysis": string[], "recommendedInterventions": string[] (3 actionable teacher/mentor interventions)}.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-      },
+    const completion = await groq.chat.completions.create({
+      model: GROQ_MODEL,
+      messages: [
+        { role: 'system', content: 'You are an academic risk analyst. You always reply with strict JSON only.' },
+        { role: 'user', content: prompt },
+      ],
+      temperature: 0.5,
+      max_tokens: 900,
+      response_format: { type: 'json_object' },
     });
 
-    const parsed = JSON.parse(response.text || '{}');
-    return res.json({ success: true, analysis: parsed });
+    const parsed = extractJson(completion.choices[0]?.message?.content || '{}');
+    return res.json({ success: true, analysis: { ...defaultExplanation, ...parsed } });
   } catch (err) {
+    console.error('Groq risk-analysis error:', err);
     return res.json({ success: true, analysis: defaultExplanation });
   }
 });
