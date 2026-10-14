@@ -1,0 +1,19 @@
+# Render Blueprint — one-click deploy for Smart Campus AI.
+# See https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: smart-campus-ai
+    runtime: node
+    plan: free
+    buildCommand: npm install --legacy-peer-deps && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/ai/status
+    envVars:
+      - key: NODE_VERSION
+        value: 24.19.0
+      - key: NODE_ENV
+        value: production
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: GROQ_API_KEY
+        sync: false
